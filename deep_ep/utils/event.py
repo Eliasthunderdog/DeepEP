@@ -1,5 +1,5 @@
 import torch
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Callable
 
 # noinspection PyUnresolvedReferences
 from deep_ep._C import EventHandle
@@ -32,18 +32,43 @@ class EventOverlap:
         # A wrapper for `with event_overlap(release_handle=True)`
         self._release_handle_by_call = False
 
-    def current_stream_wait(self, release_handle: bool = False) -> None:
+        # A hook that will be triggered after `current_stream_wait()`
+        # Useful for deterministic dispatch, which requires a sort (on the current stream) after `self.current_stream_wait()` is invoked
+        self.hook_after_wait: Optional[Callable] = None
+
+    def current_stream_wait(self, release_handle: bool = False) -> Any:
         """
         The current stream `torch.cuda.current_stream()` waits for the event to be finished.
+
+        Returns:
+            result: the return value of the registered hook, or `None` if no hook is registered.
         """
         assert self.event is not None
         self.event.current_stream_wait()
+
+        # Call epilogue hook
+        result = None
+        if self.hook_after_wait is not None:
+            result = self.hook_after_wait()
+            self.hook_after_wait = None
 
         # In `self.event`, we also have some V2 APIs storing tensors to record in it,
         # So, after waiting the current stream, those tensors can be released by deleting `self.event`
         # However, you better do it by yourself (to be compatible with multi-stream waits)
         if release_handle:
             self.event = None
+        return result
+
+    def wait(self) -> Any:
+        """Wait on the current stream and return the registered epilogue result."""
+        return self.current_stream_wait()
+
+    def register_hook_after_wait(self, hook_after_wait: Callable) -> None:
+        """
+        Register a hook, which will be invoked after `self.current_stream_wait()`
+        """
+        assert self.hook_after_wait is None, "A hook is already registered on this `EventOverlap`"
+        self.hook_after_wait = hook_after_wait
 
     def __call__(self, release_handle: bool = False) -> "EventOverlap":
         """
