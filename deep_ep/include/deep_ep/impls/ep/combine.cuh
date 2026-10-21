@@ -6,6 +6,7 @@
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/layout/ep/token.cuh>
+#include <deep_ep/layout/ep/counter.cuh>
 #include <deep_ep/layout/ep/workspace.cuh>
 
 #include <deep_ep/impls/ep/combine_utils.cuh>
@@ -13,7 +14,8 @@
 
 namespace deep_ep::ep {
 
-template <bool kIsScaleupNVLink,
+template <bool kUseCFTCounted,
+          bool kIsScaleupNVLink,
           bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs, int kNumWarps,
           int kNumRanks,
@@ -29,11 +31,14 @@ template <bool kIsScaleupNVLink,
 __global__ void __launch_bounds__(kNumThreads, 1)
 combine_impl(nv_bfloat16* x,
              float* topk_weights,
-             int* src_metadata, int* psum_num_recv_tokens_per_scaleup_rank,
+             int* src_metadata, topk_idx_t* combined_topk_idx,
+             int* psum_num_recv_tokens_per_scaleup_rank,
              const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
              void* buffer, void* workspace,
+             const uint32_t* counted_scaleup_le_ids,
              const int rank_idx,
-             int num_reduced_tokens) {
+             int num_reduced_tokens,
+             const int num_combined_tokens) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -41,6 +46,10 @@ combine_impl(nv_bfloat16* x,
     const auto lane_idx = ptx::get_lane_idx();
     const auto global_warp_idx = warp_idx * kNumSMs + sm_idx;
     constexpr bool kDoExpandedSend = not kAllowMultipleReduction and kUseExpandedLayout;
+    if constexpr (kUseCFTCounted) {
+        EP_STATIC_ASSERT(kIsScaleupNVLink, "Counted direct combine requires NVLink scaleup");
+        EP_STATIC_ASSERT(not kDoExpandedSend, "Counted direct combine does not support expanded send-all mode");
+    }
 
     // We should assign the real number of received tokens if without CPU sync
     if (num_reduced_tokens == kNumMaxTokensPerRank * kNumRanks)
@@ -57,12 +66,34 @@ combine_impl(nv_bfloat16* x,
         token_layout, kNumRanks,
         kNumMaxTokensPerRank * (kDoExpandedSend ? kNumTopk : 1),
         recv_buffer.get_buffer_end_ptr());
+    const auto counted_send_buffer = layout::BufferLayout<false>(
+        token_layout, kIsScaleupNVLink ? 0 : kNumRanks,
+        kNumMaxTokensPerRank * (kDoExpandedSend ? kNumTopk : 1),
+        recv_buffer.get_buffer_end_ptr());
+    const auto counter_layout = layout::CounterLayout(
+        math::advance_ptr(
+            buffer,
+            math::align<int64_t>(
+                math::ptr_diff(counted_send_buffer.get_buffer_end_ptr(), buffer),
+                layout::CounterLayout::kCounterStrideBytes)),
+        kNumRanks);
+    const auto token_bytes = static_cast<uint64_t>(token_layout.get_num_bytes<false>());
 
     // Init TMA
     ptx::arrival_phase phase = 0;
+    ptx::arrival_phase fabric_phase = 0;
     const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
-    if (ptx::elect_one_sync())
+    const auto fabric_mbarrier_base_offset = math::align<int64_t>(
+        kNumWarps * token_layout.get_num_bytes<true>(),
+        ptx::kFabricMBarrierAlignBytes);
+    auto fabric_mbarrier_ptr =
+        math::advance_ptr<ptx::fabric_mbarrier>(smem, fabric_mbarrier_base_offset) + warp_idx;
+    if (ptx::elect_one_sync()) {
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
+        if constexpr (kUseCFTCounted) {
+            ptx::fabric_mbarrier_init(fabric_mbarrier_ptr, 1);
+        }
+    }
     __syncwarp();
 
     // Expanding send mode must not be backward
@@ -80,11 +111,101 @@ combine_impl(nv_bfloat16* x,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
         gin, workspace_layout.get_barrier_signals(), 0, rank_idx, sm_idx, thread_idx);
 
+    int pending_fabric_bytes = 0;
+    uint64_t* pending_local_counter_ptr = nullptr;
+    const auto flush_pending_counted_send = [&]() {
+        if constexpr (kUseCFTCounted) {
+            if (pending_local_counter_ptr != nullptr) {
+                ptx::tma_store_wait();
+                ptx::red_add_rel_gpu(pending_local_counter_ptr, token_bytes);
+                pending_local_counter_ptr = nullptr;
+            }
+            if (pending_fabric_bytes > 0) {
+                // Complete the queued fabric writes before reusing the source buffer.
+                ptx::fabric_submit();
+                ptx::fabric_mbarrier_arrive_relaxed_parity(fabric_mbarrier_ptr, pending_fabric_bytes);
+                while (not ptx::fabric_mbarrier_try_wait_parity(fabric_mbarrier_ptr, fabric_phase & 1)) {}
+                fabric_phase ^= 1;
+                pending_fabric_bytes = 0;
+            }
+        }
+    };
+
+    const auto issue_counted_store = [&](const int& dst_rank_idx, const layout::TokenLayout& dst_token_buffer) {
+        if constexpr (kUseCFTCounted) {
+            const auto counter_ptr = counter_layout.get_counter_ptr(rank_idx);
+            if (dst_rank_idx == rank_idx) {
+                ptx::tma_store_1d(dst_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), static_cast<int>(token_bytes));
+                ptx::tma_store_commit();
+                pending_local_counter_ptr = counter_ptr;
+            } else {
+                const auto remote_le_id = counted_scaleup_le_ids[dst_rank_idx];
+                ptx::fabric_try_put_counted(
+                    remote_le_id,
+                    static_cast<uint64_t>(gin.get_sym_offset(dst_token_buffer.get_base_ptr())),
+                    static_cast<uint64_t>(gin.get_sym_offset(counter_ptr)),
+                    tma_buffer.get_base_ptr(),
+                    static_cast<int>(token_bytes),
+                    fabric_mbarrier_ptr);
+                pending_fabric_bytes += static_cast<int>(token_bytes);
+            }
+        }
+    };
+
+    const auto wait_receive_counters_by_topk = [&]() {
+        if constexpr (kUseCFTCounted) {
+            // All counted sends are drained before this point, so block 0 can
+            // reuse shared memory to compute receiver-side expected counts.
+            __syncthreads();
+            if (sm_idx == 0) {
+                EP_STATIC_ASSERT(kNumRanks <= 32, "Insufficient rank mask width");
+                constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
+                auto expected_token_count = reinterpret_cast<int*>(smem);
+
+                for (int src_rank_idx = thread_idx; src_rank_idx < kNumRanks; src_rank_idx += kNumThreads)
+                    expected_token_count[src_rank_idx] = 0;
+                __syncthreads();
+
+                for (int token_idx = thread_idx; token_idx < num_combined_tokens; token_idx += kNumThreads) {
+                    unsigned rank_mask = 0;
+                    #pragma unroll
+                    for (int topk_slot_idx = 0; topk_slot_idx < kNumTopk; ++ topk_slot_idx) {
+                        const auto expert_idx =
+                            static_cast<int>(__ldg(combined_topk_idx + token_idx * kNumTopk + topk_slot_idx));
+                        const auto expert_rank_idx = expert_idx >= 0 ? expert_idx / kNumExpertsPerRank : -1;
+                        if (expert_rank_idx >= 0)
+                            rank_mask |= 1u << expert_rank_idx;
+                    }
+                    while (rank_mask) {
+                        const auto src_rank_idx = __ffs(rank_mask) - 1;
+                        rank_mask ^= 1u << src_rank_idx;
+                        atomicAdd_block(expected_token_count + src_rank_idx, 1);
+                    }
+                }
+                __syncthreads();
+
+                // A single block waits for all per-source counters. Kernel
+                // completion then orders the dependent epilogue launch.
+                for (int src_rank_idx = thread_idx; src_rank_idx < kNumRanks; src_rank_idx += kNumThreads) {
+                    const auto expected_bytes = static_cast<uint64_t>(expected_token_count[src_rank_idx]) * token_bytes;
+                    const auto counter_ptr = counter_layout.get_counter_ptr(src_rank_idx);
+                    while (ptx::ld_relaxed_sys(counter_ptr) < expected_bytes) {}
+                }
+            }
+        }
+    };
+
     // Do TMA writes into the remote buffers
     int num_tokens_per_warp = math::ceil_div(num_reduced_tokens, kNumSMs * kNumWarps);
     const int token_start_idx = num_tokens_per_warp * global_warp_idx;
     const int token_end_idx = min(token_start_idx + num_tokens_per_warp, num_reduced_tokens);
     for (int i = token_start_idx; i < token_end_idx; ++ i) {
+        if constexpr (kUseCFTCounted) {
+            if (ptx::elect_one_sync())
+                flush_pending_counted_send();
+            __syncwarp();
+        }
+
         // The master slot index during dispatch
         constexpr int kMetadataStride = 2 + kNumTopk;
         const int src_token_idx = __ldg(src_metadata + i * kMetadataStride) % kNumMaxTokensPerRank;
@@ -94,10 +215,11 @@ combine_impl(nv_bfloat16* x,
 
         // Directly to the remote or via RDMA
         const bool nvlink_bypass = gin.is_nvlink_accessible<team_t>(src_rank_idx);
+        auto counted_token_buffer = recv_buffer.get_rank_buffer(kUseRankLayout ? rank_idx : src_topk_idx).get_token_buffer(src_token_idx);
         layout::TokenLayout master_token_buffer = [=]() {
             // NVLink bypass
             if (nvlink_bypass) {
-                auto token_buffer = recv_buffer.get_rank_buffer(kUseRankLayout ? rank_idx : src_topk_idx).get_token_buffer(src_token_idx);
+                auto token_buffer = counted_token_buffer;
                 token_buffer.set_base_ptr(gin.get_sym_ptr<team_t>(token_buffer.get_base_ptr(), src_rank_idx));
                 return token_buffer;
             }
@@ -138,10 +260,33 @@ combine_impl(nv_bfloat16* x,
                 ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
                 ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
                 ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-                ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
-                ptx::tma_store_commit();
             }
             __syncwarp();
+            if constexpr (kUseCFTCounted) {
+                if (topk_weights != nullptr and lane_idx < kNumTopk) {
+                    float value = 0;
+                    if constexpr (kUseExpandedLayout) {
+                        if (stored_topk_slot_idx >= 0)
+                            value = __ldg(topk_weights + stored_topk_slot_idx);
+                    } else {
+                        value = __ldg(topk_weights + i * kNumTopk + lane_idx);
+                    }
+                    tma_buffer.get_topk_weights_ptr()[lane_idx] = value;
+                }
+                ptx::tma_store_fence();
+                __syncwarp();
+                if (ptx::elect_one_sync()) {
+                    flush_pending_counted_send();
+                    issue_counted_store(src_rank_idx, counted_token_buffer);
+                }
+                __syncwarp();
+            } else {
+                if (ptx::elect_one_sync()) {
+                    ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
+                    ptx::tma_store_commit();
+                }
+                __syncwarp();
+            }
         } else if constexpr (kAllowMultipleReduction) {
             // Do local reduction
             // Sort valid top-k indices to front
@@ -166,13 +311,32 @@ combine_impl(nv_bfloat16* x,
                     __syncwarp();
                 }
             );
-            ptx::tma_store_fence();
-            __syncwarp();
+            if constexpr (kUseCFTCounted) {
+                if (topk_weights != nullptr and lane_idx < kNumTopk) {
+                    float value = 0;
+                    if constexpr (kUseExpandedLayout) {
+                        if (stored_topk_slot_idx >= 0)
+                            value = __ldg(topk_weights + stored_topk_slot_idx);
+                    } else {
+                        value = __ldg(topk_weights + i * kNumTopk + lane_idx);
+                    }
+                    tma_buffer.get_topk_weights_ptr()[lane_idx] = value;
+                }
+                ptx::tma_store_fence();
+                __syncwarp();
+                if (ptx::elect_one_sync()) {
+                    flush_pending_counted_send();
+                    issue_counted_store(src_rank_idx, counted_token_buffer);
+                }
+            } else {
+                ptx::tma_store_fence();
+                __syncwarp();
 
-            // Issue TMA stores
-            if (ptx::elect_one_sync()) {
-                ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
-                ptx::tma_store_commit();
+                // Issue TMA stores
+                if (ptx::elect_one_sync()) {
+                    ptx::tma_store_1d(master_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), kNumHiddenBytes);
+                    ptx::tma_store_commit();
+                }
             }
             __syncwarp();
         } else {
@@ -213,34 +377,44 @@ combine_impl(nv_bfloat16* x,
             }
         }
 
-        // Write topk weights
-        if (not kDoExpandedSend and topk_weights != nullptr and lane_idx < kNumTopk) {
-            float value = 0;
-            if constexpr (kUseExpandedLayout) {
-                if (stored_topk_slot_idx >= 0)
-                    value = __ldg(topk_weights + stored_topk_slot_idx);
-            } else {
-                value = __ldg(topk_weights + (i * kNumTopk + lane_idx));
+        if constexpr (not kUseCFTCounted) {
+            // Write topk weights
+            if (not kDoExpandedSend and topk_weights != nullptr and lane_idx < kNumTopk) {
+                float value = 0;
+                if constexpr (kUseExpandedLayout) {
+                    if (stored_topk_slot_idx >= 0)
+                        value = __ldg(topk_weights + stored_topk_slot_idx);
+                } else {
+                    value = __ldg(topk_weights + (i * kNumTopk + lane_idx));
+                }
+                master_token_buffer.get_topk_weights_ptr()[lane_idx] = value;
             }
-            master_token_buffer.get_topk_weights_ptr()[lane_idx] = value;
-        }
-        __syncwarp();
+            __syncwarp();
 
-        // Wait send buffer's TMA store and issue RDMA send
-        // NOTES: `kDoExpandedSend` mode has already issued
-        if (not kDoExpandedSend and not nvlink_bypass and ptx::elect_one_sync()) {
-            ptx::tma_store_wait();
-            const auto dst_ptr = recv_buffer.get_rank_buffer(kUseRankLayout ? rank_idx : src_topk_idx)
-                .get_token_buffer(src_token_idx).get_base_ptr();
-            gin.put<team_t>(dst_ptr, master_token_buffer.get_base_ptr(),
-                            master_token_buffer.get_num_bytes<false>(), src_rank_idx);
+            // Wait send buffer's TMA store and issue RDMA send
+            // NOTES: `kDoExpandedSend` mode has already issued
+            if (not kDoExpandedSend and not nvlink_bypass and ptx::elect_one_sync()) {
+                ptx::tma_store_wait();
+                const auto dst_ptr = recv_buffer.get_rank_buffer(kUseRankLayout ? rank_idx : src_topk_idx)
+                    .get_token_buffer(src_token_idx).get_base_ptr();
+                gin.put<team_t>(dst_ptr, master_token_buffer.get_base_ptr(),
+                                master_token_buffer.get_num_bytes<false>(), src_rank_idx);
+            }
         }
     }
 
-    // Final barrier to ensure data arrival
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag1, true, true, false>(
-        gin, workspace_layout.get_barrier_signals(), 0, rank_idx, sm_idx, thread_idx);
+    if constexpr (kUseCFTCounted) {
+        if (ptx::elect_one_sync())
+            flush_pending_counted_send();
+        __syncwarp();
+
+        wait_receive_counters_by_topk();
+    } else {
+        // Final barrier to ensure data arrival
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag1, true, true, false>(
+            gin, workspace_layout.get_barrier_signals(), 0, rank_idx, sm_idx, thread_idx);
+    }
 }
 
 }  // namespace deep_ep::ep

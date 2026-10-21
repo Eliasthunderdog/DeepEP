@@ -10,8 +10,10 @@
 #include <nccl_device.h>
 
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/ptx.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/layout/ep/token.cuh>
+#include <deep_ep/layout/ep/counter.cuh>
 
 #include "../../runtime/jit.hpp"
 
@@ -26,6 +28,22 @@ static int get_num_notify_smem_bytes(const int& num_ranks, const int& num_expert
 static layout::TokenLayout get_dispatch_token_layout(
     const int& hidden, const int& elem_size, const int& num_sf_packs, const int& num_topk) {
     return layout::TokenLayout(hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+}
+
+static void* get_direct_dispatch_counted_counter_buffer(void* buffer,
+                                                        const layout::TokenLayout& token_layout,
+                                                        const int& num_max_tokens_per_rank,
+                                                        const int& num_scaleup_ranks) {
+    const auto recv_buffer_layout = layout::BufferLayout<false>(
+        token_layout, num_scaleup_ranks, num_max_tokens_per_rank, buffer);
+    const auto send_buffer_layout = layout::BufferLayout<false>(
+        token_layout, 0, num_max_tokens_per_rank,
+        recv_buffer_layout.get_buffer_end_ptr());
+    return math::advance_ptr(
+        buffer,
+        math::align<int64_t>(
+            math::ptr_diff(send_buffer_layout.get_buffer_end_ptr(), buffer),
+            layout::CounterLayout::kCounterStrideBytes));
 }
 
 static void launch_dispatch(void* x, void* sf,
@@ -51,6 +69,8 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
                             const bool& do_cpu_sync,
+                            const bool& use_cft_counted,
+                            uint32_t* counted_scaleup_le_ids,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -58,6 +78,7 @@ static void launch_dispatch(void* x, void* sf,
 
     // Utils
     const auto num_ranks = num_scaleout_ranks * num_scaleup_ranks;
+    const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
 
     // Notify warps
     // TODO: why don't we use 4 notify warps?
@@ -71,11 +92,40 @@ static void launch_dispatch(void* x, void* sf,
     int num_scaleout_warps = 0, num_forward_warps = 0;
     int num_threads = 0;
 
+    if (use_cft_counted) {
+#if !((defined(CUDART_VERSION) && CUDART_VERSION >= 13030) || (defined(CUDA_VERSION) && CUDA_VERSION >= 13030))
+        EP_HOST_ASSERT(false and
+                       "CFT counted dispatch requires CUDA 13.3+ counted-write support");
+#endif
+        EP_HOST_ASSERT(num_scaleout_ranks == 1 and
+                       "CFT counted dispatch is only supported for direct dispatch");
+        EP_HOST_ASSERT(is_scaleup_nvlink and
+                       "CFT counted dispatch does not support GIN/RDMA scaleup peers in this release");
+        EP_HOST_ASSERT(at::cuda::getCurrentDeviceProperties()->major >= 10 and
+                       "Counted direct dispatch requires SM100+");
+        EP_HOST_ASSERT(counted_scaleup_le_ids != nullptr);
+    }
+
     // Maximize shared memory utilization
     if (num_scaleout_ranks == 1) {
-        const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
         num_dispatch_warps = std::min<int>(
             (num_smem_bytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(), 32 - num_notify_warps);
+        if (use_cft_counted) {
+            // Counted fabric sends need one 64-byte completion mbarrier per dispatch warp
+            // after the TMA staging area. Trim dispatch warps until both regions fit.
+            while (num_dispatch_warps > 0) {
+                const auto tma_smem_bytes =
+                    static_cast<int64_t>(num_dispatch_warps) * token_layout.get_num_bytes<true>();
+                const auto counted_smem_bytes =
+                    math::align<int64_t>(num_notify_smem_bytes + tma_smem_bytes, ptx::kFabricMBarrierAlignBytes) +
+                    static_cast<int64_t>(num_dispatch_warps) * sizeof(ptx::fabric_mbarrier);
+                if (counted_smem_bytes <= num_smem_bytes)
+                    break;
+                -- num_dispatch_warps;
+            }
+            EP_HOST_ASSERT(num_dispatch_warps > 0 and
+                           "Insufficient shared memory for counted direct dispatch");
+        }
         num_threads = (num_notify_warps + num_dispatch_warps) * 32;
     } else {
         // Hybrid kernels
@@ -84,12 +134,19 @@ static void launch_dispatch(void* x, void* sf,
         num_threads = (num_notify_warps + num_scaleout_warps + num_forward_warps) * 32;
     }
 
+    if (use_cft_counted) {
+        void* counter_buffer = get_direct_dispatch_counted_counter_buffer(
+            buffer, token_layout, num_max_tokens_per_rank, num_scaleup_ranks);
+        const auto counter_layout = layout::CounterLayout(counter_buffer, num_scaleup_ranks);
+        CUDA_RUNTIME_CHECK(cudaMemsetAsync(counter_buffer, 0, counter_layout.get_num_bytes(), stream));
+    }
+
     // Compile
     std::string header_name, func_name;
     if (num_scaleout_ranks == 1) {
         header_name = "dispatch";
-        func_name = std::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
-            is_scaleup_nvlink,
+        func_name = std::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            use_cft_counted, is_scaleup_nvlink,
             do_cpu_sync,
             reuse_slot_indices,
             num_sms,
@@ -143,6 +200,7 @@ static void __instantiate_kernel() {{
             nccl_dev_comm, nccl_window,
             buffer,
             workspace, mapped_host_workspace,
+            counted_scaleup_le_ids,
             scaleup_rank_idx
         );
     } else {

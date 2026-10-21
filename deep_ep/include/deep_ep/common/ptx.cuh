@@ -3,6 +3,8 @@
 #include <cuda/barrier>
 #include <cuda_bf16.h>
 
+#include <cstdint>
+
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
 
@@ -11,6 +13,20 @@ namespace deep_ep::ptx {
 /// Declarations
 using mbarrier = cuda::barrier<cuda::thread_scope_block>;
 using arrival_phase = uint32_t;
+
+static constexpr int kFabricMBarrierAlignBytes = 64;
+// Fabric counted-write completion mbarrier. SM100 layout::v1 barriers occupy
+// 64 bytes even though the inline PTX names the first 64-bit word.
+struct alignas(kFabricMBarrierAlignBytes) fabric_mbarrier {
+    uint64_t value;
+};
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && \
+    ((defined(CUDART_VERSION) && CUDART_VERSION >= 13030) || (defined(CUDA_VERSION) && CUDA_VERSION >= 13030))
+#define DEEP_EP_HAS_CFT_COUNTED_WRITES 1
+#else
+#define DEEP_EP_HAS_CFT_COUNTED_WRITES 0
+#endif
 
 #ifdef __CUDACC__
 
@@ -192,6 +208,86 @@ __forceinline__ __device__ void multimem_cp_async_bulk(
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(src_ptr))),
                  "r"(num_bytes)
                  : "memory");
+}
+
+/// Fabric counted-write helpers
+__forceinline__ __device__ void fabric_mbarrier_init(fabric_mbarrier* ptr, const int& arrive_count = 1) {
+#if DEEP_EP_HAS_CFT_COUNTED_WRITES
+    asm volatile("mbarrier.init.shared.layout::v1.b64 [%0], %1;" ::
+                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
+                 "r"(arrive_count)
+                 : "memory");
+#else
+    trap();
+#endif
+}
+
+__forceinline__ __device__ void fabric_mbarrier_arrive_relaxed_parity(fabric_mbarrier* ptr, const int& num_bytes) {
+#if DEEP_EP_HAS_CFT_COUNTED_WRITES
+    asm volatile("mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [%0], %1;" ::
+                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
+                 "r"(num_bytes / 16)
+                 : "memory");
+#else
+    trap();
+#endif
+}
+
+__forceinline__ __device__ bool fabric_mbarrier_try_wait_parity(fabric_mbarrier* ptr, const int& parity) {
+#if DEEP_EP_HAS_CFT_COUNTED_WRITES
+    int ready, reported_error;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred rdy;\n\t"
+        ".reg .pred report;\n\t"
+        ".reg .b8 reportVal;\n\t"
+        "mbarrier.try_wait.parity.phase_type::primary.acquire.cta.shared::cta.b64 rdy|report, reportVal, [%2], %3;\n\t"
+        "selp.b32 %0, 1, 0, rdy;\n\t"
+        "mov.u32 %1, 0;\n\t"
+        "@rdy selp.b32 %1, 1, 0, report;\n\t"
+        "}"
+        : "=r"(ready), "=r"(reported_error)
+        : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
+          "r"(parity)
+        : "memory");
+    if (ready != 0 and reported_error != 0) {
+        printf("DeepEP counted fabric operation reported an error\n");
+        trap();
+    }
+    return ready != 0;
+#else
+    trap();
+    return false;
+#endif
+}
+
+__forceinline__ __device__ void fabric_try_put_counted(
+    const uint32_t& le_id, const uint64_t& dst_offset, const uint64_t& counter_offset,
+    void* src_ptr, const int& num_bytes, fabric_mbarrier* ptr) {
+#if DEEP_EP_HAS_CFT_COUNTED_WRITES
+    asm volatile(
+        "fabric.try_put.async.counted::bytes.shared::cta.mbarrier::complete_tx::16B"
+        ".mbarrier::report::fabric.relaxed.sys.b128 "
+        "[%0, %1, %2], [%3], %4, [%5];"
+        ::
+        "r"(le_id),
+        "l"(dst_offset),
+        "l"(counter_offset),
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(src_ptr))),
+        "r"(num_bytes),
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr)))
+        : "memory");
+#else
+    trap();
+#endif
+}
+
+__forceinline__ __device__ void fabric_submit() {
+#if DEEP_EP_HAS_CFT_COUNTED_WRITES
+    asm volatile("fabric.submit;" ::: "memory");
+#else
+    trap();
+#endif
 }
 
 template <class dtype_t>
@@ -381,6 +477,10 @@ __forceinline__ __device__ void red_add(const int64_t* ptr, const int64_t& value
     asm volatile("red.gpu.global.add.u64 [%0], %1;" :: "l"(ptr), "l"(value));
 }
 
+__forceinline__ __device__ void red_add_rel_gpu(const uint64_t* ptr, const uint64_t& value) {
+    asm volatile("red.release.gpu.global.add.u64 [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
 __forceinline__ __device__ void red_add_rel_sys(const int* ptr, const int& value) {
     asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
@@ -420,6 +520,21 @@ __forceinline__ __device__ void st_relaxed_gpu(void* ptr, dtype_t value) {
     } else if constexpr (sizeof(dtype_t) == 8) {
         uint64_t int_value = reinterpret_cast<const uint64_t&>(value);
         asm volatile("st.relaxed.gpu.global.u64 [%0], %1;" :: "l"(ptr), "l"(int_value));
+    } else {
+        EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8, "Invalid data type length");
+    }
+}
+
+template <typename dtype_t>
+__forceinline__ __device__ dtype_t ld_relaxed_sys(const dtype_t* ptr) {
+    if constexpr (sizeof(dtype_t) == 4) {
+        uint32_t value;
+        asm volatile("ld.relaxed.sys.L1::no_allocate.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
+        return reinterpret_cast<const dtype_t&>(value);
+    } else if constexpr (sizeof(dtype_t) == 8) {
+        uint64_t value;
+        asm volatile("ld.relaxed.sys.L1::no_allocate.global.u64 %0, [%1];" : "=l"(value) : "l"(ptr));
+        return reinterpret_cast<const dtype_t&>(value);
     } else {
         EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8, "Invalid data type length");
     }

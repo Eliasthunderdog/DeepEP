@@ -119,6 +119,39 @@ public:
         destroyed = true;
     }
 
+    static constexpr int kCFTCountedDispatchMaxTokensPerRank = 256;
+    static constexpr int kCFTCountedCombineMaxTokensPerRank = 256;
+
+    bool supports_counted_scaleup() const {
+#if (defined(CUDART_VERSION) and CUDART_VERSION >= 13030) or (defined(CUDA_VERSION) and CUDA_VERSION >= 13030)
+        return context->is_scaleup_nvlink and
+               context->supports_counted_scaleup_le() and
+               at::cuda::getCurrentDeviceProperties()->major >= 10;
+#else
+        return false;
+#endif
+    }
+
+    bool is_counted_scaleup_ready() const {
+        return context->is_counted_scaleup_le_ready();
+    }
+
+    pybind11::bytes export_counted_scaleup_le_handle() {
+        const auto handle = context->export_counted_scaleup_le_handle();
+        return pybind11::bytes(reinterpret_cast<const char*>(handle.data()), handle.size());
+    }
+
+    void import_counted_scaleup_le_handles(const std::vector<std::string>& handles) {
+        std::vector<std::vector<uint8_t>> handle_bytes;
+        handle_bytes.reserve(handles.size());
+        for (const auto& handle: handles)
+            handle_bytes.emplace_back(handle.begin(), handle.end());
+
+        context->import_counted_scaleup_le_handles(
+            handle_bytes,
+            static_cast<layout::EPSignals*>(context->workspace)->counted_scaleup_le_ids);
+    }
+
     static torch::cuda::CUDAStream stream_control_prologue(const std::optional<EventHandle>& previous_event) {
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
         const auto comm_stream = comm::get_comm_stream();
@@ -184,7 +217,8 @@ public:
                                             const int& hidden, const int& num_sf_packs, const int& num_topk,
                                             const int& elem_size,
                                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
-                                            const bool& is_scaleup_nvlink) {
+                                            const bool& is_scaleup_nvlink,
+                                            const bool& use_cft_counted = false) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
 
@@ -194,7 +228,11 @@ public:
                 token_layout, is_scaleup_nvlink ? 0 : 1, num_max_tokens_per_rank);
             const auto recv_buffer_layout = layout::BufferLayout<false>(
                 token_layout, num_ranks, num_max_tokens_per_rank);
-            return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            const auto data_bytes = send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            if (not use_cft_counted)
+                return data_bytes;
+            return math::align<int64_t>(data_bytes, layout::CounterLayout::kCounterStrideBytes) +
+                   layout::CounterLayout::get_num_bytes(num_scaleup_ranks);
         } else {
             // Hybrid dispatch
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
@@ -213,7 +251,8 @@ public:
     static int64_t get_combine_buffer_size(const int& num_max_tokens_per_rank, const int& hidden, const int& num_topk,
                                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                            const bool& is_scaleup_nvlink,
-                                           const bool& allow_multiple_reduction) {
+                                           const bool& allow_multiple_reduction,
+                                           const bool& use_cft_counted = false) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
         const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
 
@@ -227,7 +266,11 @@ public:
                 num_max_tokens_per_rank * (allow_multiple_reduction ? 1 : num_topk));
             const auto recv_buffer_layout = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_layout, num_max_tokens_per_rank);
-            return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            const auto data_bytes = send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            if (not use_cft_counted)
+                return data_bytes;
+            return math::align<int64_t>(data_bytes, layout::CounterLayout::kCounterStrideBytes) +
+                   layout::CounterLayout::get_num_bytes(num_scaleup_ranks);
         } else {
             // Hybrid combine
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
@@ -244,6 +287,18 @@ public:
                    scaleout_send_buffer.get_num_bytes() +
                    scaleout_recv_buffer.get_num_bytes();
         }
+    }
+
+    static bool may_use_cft_counted_scaleup(const int& num_scaleout_ranks,
+                                            const int& num_scaleup_ranks,
+                                            const int& num_nvl_ranks) {
+#if (defined(CUDART_VERSION) and CUDART_VERSION >= 13030) or (defined(CUDA_VERSION) and CUDA_VERSION >= 13030)
+        return num_scaleout_ranks == 1 and
+               num_scaleup_ranks == num_nvl_ranks and
+               num_nvl_ranks > 1;
+#else
+        return false;
+#endif
     }
 
     static int64_t calculate_buffer_size(const int64_t& nccl_comm,
@@ -270,13 +325,15 @@ public:
         const auto num_dispatch_bytes = get_dispatch_buffer_size(
             num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
             num_scaleout_ranks, num_scaleup_ranks,
-            is_scaleup_nvlink);
+            is_scaleup_nvlink,
+            may_use_cft_counted_scaleup(num_scaleout_ranks, num_scaleup_ranks, num_nvl_ranks));
 
         // Combine layout
         const auto num_combine_bytes = get_combine_buffer_size(
             num_max_tokens_per_rank, hidden, num_topk,
             num_scaleout_ranks, num_scaleup_ranks,
-            is_scaleup_nvlink, allow_multiple_reduction);
+            is_scaleup_nvlink, allow_multiple_reduction,
+            may_use_cft_counted_scaleup(num_scaleout_ranks, num_scaleup_ranks, num_nvl_ranks));
 
         // Return the maximum of those layouts, aligned to 2 MB
         return math::align<int64_t>(std::max(num_dispatch_bytes, num_combine_bytes), kNumAllocationAlignmentBytes);
@@ -540,11 +597,24 @@ public:
             channel_linked_list_ptr = channel_linked_list->data_ptr<int>();
         }
 
+        const auto counted_dispatch_buffer_bytes = get_dispatch_buffer_size(
+            num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
+            context->num_scaleout_ranks, context->num_scaleup_ranks,
+            context->is_scaleup_nvlink, true);
+        // The capacity is team-consistent even when token counts differ across ranks.
+        const bool use_cft_counted_dispatch =
+            supports_counted_scaleup() and
+            is_counted_scaleup_ready() and
+            num_max_tokens_per_rank <= kCFTCountedDispatchMaxTokensPerRank and
+            counted_dispatch_buffer_bytes <= num_buffer_bytes;
+        auto counted_scaleup_le_ids = use_cft_counted_dispatch ?
+            static_cast<layout::EPSignals*>(context->workspace)->counted_scaleup_le_ids : nullptr;
+
         // Check buffer size
         EP_HOST_ASSERT(get_dispatch_buffer_size(
                        num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
                        context->num_scaleout_ranks, context->num_scaleup_ranks,
-                       context->is_scaleup_nvlink) <= num_buffer_bytes);
+                       context->is_scaleup_nvlink, use_cft_counted_dispatch) <= num_buffer_bytes);
 
         // Ready and clean host workspace for this round
         const auto host_workspace_layout = layout::EPWorkspaceLayout(
@@ -579,6 +649,7 @@ public:
                         num_smem_bytes,
                         num_qps, context->num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
+                        use_cft_counted_dispatch, counted_scaleup_le_ids,
                         comm_stream);
 
         // For tensor recording
@@ -862,10 +933,25 @@ public:
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream);
         const auto comm_stream = comm::get_comm_stream();
 
+        const auto counted_combine_buffer_bytes = get_combine_buffer_size(
+            num_max_tokens_per_rank, hidden, num_topk,
+            context->num_scaleout_ranks, context->num_scaleup_ranks,
+            context->is_scaleup_nvlink, allow_multiple_reduction, true);
+        const bool use_cft_counted_combine =
+            supports_counted_scaleup() and
+            is_counted_scaleup_ready() and
+            context->num_scaleout_ranks == 1 and
+            context->is_scaleup_nvlink and
+            not (use_expanded_layout and not allow_multiple_reduction) and
+            num_max_tokens_per_rank <= kCFTCountedCombineMaxTokensPerRank and
+            counted_combine_buffer_bytes <= num_buffer_bytes;
+        auto counted_scaleup_le_ids = use_cft_counted_combine ?
+            static_cast<layout::EPSignals*>(context->workspace)->counted_scaleup_le_ids : nullptr;
+
         // Check buffer size
         EP_HOST_ASSERT(get_combine_buffer_size(num_max_tokens_per_rank, hidden, num_topk,
                                                context->num_scaleout_ranks, context->num_scaleup_ranks,
-                                               context->is_scaleup_nvlink, allow_multiple_reduction) <= num_buffer_bytes);
+                                               context->is_scaleup_nvlink, allow_multiple_reduction, use_cft_counted_combine) <= num_buffer_bytes);
 
         // Optional configs and metadata for hybrid combine
         int num_channels = 1;
@@ -898,12 +984,13 @@ public:
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
             src_metadata.data_ptr<int>(),
+            combined_topk_idx.data_ptr<topk_idx_t>(),
             psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
             token_metadata_at_forward_ptr,
             channel_linked_list_ptr,
             context->dev_comm, context->window,
             context->buffer, context->workspace,
-            num_reduced_tokens, num_max_tokens_per_rank,
+            num_reduced_tokens, num_combined_tokens, num_max_tokens_per_rank,
             hidden, num_experts, num_topk,
             num_qps, context->num_gpu_timeout_cycles,
             context->num_scaleout_ranks, context->num_scaleup_ranks,
@@ -912,6 +999,7 @@ public:
             num_sms, jit->device.get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
+            use_cft_counted_combine, counted_scaleup_le_ids,
             comm_stream);
 
         // For tensor recording
@@ -1086,6 +1174,10 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<int, int, int64_t, int64_t, int64_t, bool, bool, bool, std::optional<int>, int, int, int, bool>())
         .def_readonly("context", &EPBuffer::context)
         .def_readonly("lb_storage", &EPBuffer::lb_storage)
+        .def("supports_counted_scaleup", &EPBuffer::supports_counted_scaleup)
+        .def("is_counted_scaleup_ready", &EPBuffer::is_counted_scaleup_ready)
+        .def("export_counted_scaleup_le_handle", &EPBuffer::export_counted_scaleup_le_handle)
+        .def("import_counted_scaleup_le_handles", &EPBuffer::import_counted_scaleup_le_handles)
         .def("dispatch", &EPBuffer::dispatch)
         .def("combine", &EPBuffer::combine)
         .def("lb_prefetch_weights", &EPBuffer::lb_prefetch_weights)

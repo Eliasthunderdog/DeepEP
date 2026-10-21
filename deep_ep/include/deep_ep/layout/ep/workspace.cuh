@@ -19,6 +19,7 @@ struct alignas(kNumRDMAAlignmentBytes) EPSignals {
     int64_t scaleout_channel_signaled_tail[kNumMaxChannels][kNumMaxRanks];
     int channel_scaleup_tail[kNumMaxChannels][kNumMaxRanks];
     int lb_chunk_idx_counter;
+    uint32_t counted_scaleup_le_ids[kNumMaxRanks];
 };
 EP_STATIC_ASSERT(sizeof(EPSignals) <= kNumMaxSignalBytes, "Too many signals");
 
