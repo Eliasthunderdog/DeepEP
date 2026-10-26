@@ -12,6 +12,13 @@
 #include <deep_jit/utils/no_ref_ptr.hpp>
 
 #include "symmetric.hpp"
+#include "../../utils/lazy_driver.hpp"
+
+#if (defined(CUDART_VERSION) && CUDART_VERSION >= 13030) || (defined(CUDA_VERSION) && CUDA_VERSION >= 13030)
+#define DEEP_EP_HAS_LOGICAL_ENDPOINTS 1
+#else
+#define DEEP_EP_HAS_LOGICAL_ENDPOINTS 0
+#endif
 
 namespace deep_ep::comm {
 
@@ -32,6 +39,13 @@ class Context {
     void* raw_window_ptr;
     std::shared_ptr<symmetric::SymmetricMemory> symmetric_memory;
     bool finalized = false;
+
+#if DEEP_EP_HAS_LOGICAL_ENDPOINTS
+    bool counted_scaleup_le_created = false;
+    bool counted_scaleup_le_ready = false;
+    CUlogicalEndpointId counted_scaleup_le_id = 0;
+    std::vector<CUlogicalEndpointId> imported_counted_scaleup_le_ids;
+#endif
 
 public:
     int rank_idx, num_ranks;
@@ -83,6 +97,11 @@ public:
     void set_barrier_signals(void* ptr) {
         barrier_signals = ptr;
     }
+
+    bool supports_counted_scaleup_le() const;
+    bool is_counted_scaleup_le_ready() const;
+    std::vector<uint8_t> export_counted_scaleup_le_handle();
+    void import_counted_scaleup_le_handles(const std::vector<std::vector<uint8_t>>& handles, uint32_t* device_le_ids);
 
     void finalize();
 };

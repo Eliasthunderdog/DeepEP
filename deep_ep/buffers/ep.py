@@ -207,6 +207,11 @@ class EPHandle:
 
 class EPBuffer(BufferBase):
     """
+    Counted writes are enabled by default on CUDA 13.3+ / SM100+ within one NVLink
+    domain (2-32 ranks), for dispatch/combine capacities up to 256 tokens per rank.
+    Set EP_USE_COUNTED_OPS=0 on every rank to use the regular path. Expanded combine
+    without multiple reduction uses the regular path in either mode.
+
     The EP communication buffer, which supports:
         - high-throughput expert-parallel all-to-all (dispatch and combine, using NVLink and/or RDMA)
 
@@ -357,10 +362,31 @@ class EPBuffer(BufferBase):
         # Physical rank indices
         self.num_rdma_ranks, self.num_nvlink_ranks = self.get_physical_domain_size()
 
+        self._counted_scaleup_ready = False
+        self._setup_counted_scaleup()
+
         # Call a barrier to ensure initialization visibility for all peers
         torch.cuda.synchronize()
         group.barrier()
         torch.cuda.synchronize()
+
+    def _setup_counted_scaleup(self) -> None:
+        # `EP_USE_COUNTED_DISPATCH` is kept as a compatibility alias for existing scripts.
+        enabled = os.environ.get('EP_USE_COUNTED_OPS', os.environ.get('EP_USE_COUNTED_DISPATCH', '1')) != '0'
+        local_supported = enabled and self.runtime.supports_counted_scaleup()
+        supported_by_rank = [None] * self.num_ranks
+        dist.all_gather_object(supported_by_rank, local_supported, self.group)
+
+        if not any(supported_by_rank):
+            return
+        if not all(supported_by_rank):
+            raise RuntimeError(f'Counted scale-up support is inconsistent across ranks: {supported_by_rank}')
+
+        local_handle = bytes(self.runtime.export_counted_scaleup_le_handle())
+        handles = [None] * self.num_ranks
+        dist.all_gather_object(handles, local_handle, self.group)
+        self.runtime.import_counted_scaleup_le_handles(handles)
+        self._counted_scaleup_ready = self.runtime.is_counted_scaleup_ready()
 
     def destroy(self) -> None:
         """
