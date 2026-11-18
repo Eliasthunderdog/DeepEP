@@ -11,7 +11,7 @@
 #include <deep_ep/layout/ep/token.cuh>
 #include <deep_ep/layout/ep/counter.cuh>
 #include <deep_ep/layout/ep/workspace.cuh>
-
+#include <deep_ep/impls/ep/epilogue_ready.cuh>
 
 namespace deep_ep::ep {
 
@@ -26,6 +26,8 @@ template <bool kUseCFTCounted,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          int kNumCounterGroups = 0,
+          bool kResetSenderSlotsEarly = false,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumDispatchThreads = kNumDispatchWarps * 32,
           int kNumThreads = kNumNotifyThreads + kNumDispatchThreads,
@@ -43,11 +45,14 @@ dispatch_impl(
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window, void* buffer,
     void* workspace, void* mapped_host_workspace,
     const uint32_t* counted_scaleup_le_ids,
-    const int rank_idx
+    const int rank_idx, const int num_epilogue_blocks
 ) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
+
+    EP_STATIC_ASSERT(kNumCounterGroups == (kUseCFTCounted ? 8 : 0), "Counted arrivals require eight groups");
+    EP_STATIC_ASSERT(not kUseCFTCounted or kIsScaleupNVLink, "Counted arrivals require NVLink");
 
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
@@ -85,56 +90,36 @@ dispatch_impl(
             math::align<int64_t>(
                 math::ptr_diff(counted_send_buffer_layout.get_buffer_end_ptr(), data_buffer),
                 layout::CounterLayout::kCounterStrideBytes)),
-        kNumRanks);
-    const auto token_bytes = static_cast<uint64_t>(token_layout.get_num_bytes<false>());
-
-    const auto wait_receive_counters_by_count = [&](const int* count, const int& wait_thread_idx, const int& num_wait_threads) {
-        for (int src_rank_idx = wait_thread_idx; src_rank_idx < kNumRanks; src_rank_idx += num_wait_threads) {
-            const auto expected_bytes = static_cast<uint64_t>(count[src_rank_idx]) * token_bytes;
-            const auto counter_ptr = counter_layout.get_counter_ptr(src_rank_idx);
-            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto counter = ptx::ld_relaxed_sys(counter_ptr);
-                if (counter >= expected_bytes)
-                    return true;
-
-                if (is_last_check) {
-                    printf("DeepEP counted dispatch counter wait timeout, rank: %d/%d, "
-                           "src rank: %d, counter: %llu, expected bytes: %llu\n",
-                           rank_idx, kNumRanks, src_rank_idx,
-                           static_cast<unsigned long long>(counter),
-                           static_cast<unsigned long long>(expected_bytes));
-                }
-                return false;
-            });
+        kNumRanks * (kNumCounterGroups > 0 ? kNumCounterGroups : 1));
+    // Reuse the initial barrier to order grouped slot-allocator resets, too.
+    // The host keeps this policy for fallback dispatches on the same buffer.
+    if constexpr (kUseCFTCounted or kResetSenderSlotsEarly) {
+        if (sm_idx == 0) {
+            if constexpr (kUseCFTCounted) {
+                for (int i = thread_idx; i < counter_layout.num_scaleup_ranks; i += kNumThreads)
+                    ptx::st_relaxed_sys(counter_layout.get_counter_ptr(i), uint64_t{0});
+            }
+            if constexpr (kResetSenderSlotsEarly and not kReuseSlotIndices) {
+                if (thread_idx < kNumRanks)
+                    workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+            }
+            __syncthreads();
         }
-    };
-    const auto wait_receive_counters_by_psum = [&](const int& wait_thread_idx, const int& num_wait_threads) {
-        for (int src_rank_idx = wait_thread_idx; src_rank_idx < kNumRanks; src_rank_idx += num_wait_threads) {
-            const auto end = psum_num_recv_tokens_per_scaleup_rank[src_rank_idx];
-            const auto start = src_rank_idx == 0 ? 0 : psum_num_recv_tokens_per_scaleup_rank[src_rank_idx - 1];
-            const auto expected_bytes = static_cast<uint64_t>(end - start) * token_bytes;
-            const auto counter_ptr = counter_layout.get_counter_ptr(src_rank_idx);
-            comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto counter = ptx::ld_relaxed_sys(counter_ptr);
-                if (counter >= expected_bytes)
-                    return true;
-
-                if (is_last_check) {
-                    printf("DeepEP counted dispatch counter wait timeout, rank: %d/%d, "
-                           "src rank: %d, counter: %llu, expected bytes: %llu\n",
-                           rank_idx, kNumRanks, src_rank_idx,
-                           static_cast<unsigned long long>(counter),
-                           static_cast<unsigned long long>(expected_bytes));
-                }
-                return false;
-            });
-        }
-    };
+    }
 
     // Barrier without TMA store flush, without prologue grid sync
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
         gin, workspace_layout.get_barrier_signals(), 0, rank_idx, sm_idx, thread_idx);
+
+    // Counted consumers may launch early and acquire their readiness sentinel.
+    if constexpr (kUseCFTCounted)
+        cudaTriggerProgrammaticLaunchCompletion();
+
+    if constexpr (kNumCounterGroups > 0 and kReuseSlotIndices) {
+        if (sm_idx == 0)
+            publish_epilogue_ready<false>(workspace_layout.signals.dispatch_epilogue_ready, num_epilogue_blocks);
+    }
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
@@ -316,9 +301,13 @@ dispatch_impl(
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
-            if constexpr (kUseCFTCounted) {
+            if constexpr (kNumCounterGroups > 0) {
+                // Join only notify warps: sender warps may still be transmitting.
+                // Prefix sums and expert counts are the only producer metadata
+                // consumed by the copy epilogue before it waits for payloads.
                 ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
-                wait_receive_counters_by_count(rank_count, thread_idx, kNumNotifyThreads);
+                for (int i = thread_idx; i < num_epilogue_blocks; i += kNumNotifyThreads)
+                    ptx::st_release_sys(workspace_layout.signals.dispatch_epilogue_ready + i, uint32_t{1});
             }
         }
     } else {
@@ -344,7 +333,8 @@ dispatch_impl(
         if (ptx::elect_one_sync()) {
             ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
             if constexpr (kUseCFTCounted) {
-                ptx::fabric_mbarrier_init(fabric_mbarrier_ptr, 1);
+                // Every lane contributes one arrival when a fabric batch is flushed.
+                ptx::fabric_mbarrier_init(fabric_mbarrier_ptr, 32);
             }
         }
         __syncwarp();
@@ -355,17 +345,20 @@ dispatch_impl(
             if constexpr (kUseCFTCounted) {
                 if (pending_local_counter_ptr != nullptr) {
                     ptx::tma_store_wait();
-                    ptx::red_add_rel_gpu(
+                    ptx::red_add_gpu(
                         pending_local_counter_ptr,
                         static_cast<uint64_t>(token_layout.get_num_bytes<false>()));
                     pending_local_counter_ptr = nullptr;
                 }
-                if (pending_fabric_bytes > 0) {
-                    // All destinations share this token's source buffer and one
-                    // completion phase. Wait once before the buffer is reused.
-                    ptx::fabric_submit();
+                if (__any_sync(0xffffffff, pending_fabric_bytes > 0)) {
+
+                    // All lanes arrive, including inactive lanes with zero transactions.
+                    // The 32-arrival phase cannot finish before all expected bytes are added.
                     ptx::fabric_mbarrier_arrive_relaxed_parity(fabric_mbarrier_ptr, pending_fabric_bytes);
-                    while (not ptx::fabric_mbarrier_try_wait_parity(fabric_mbarrier_ptr, fabric_phase & 1)) {}
+                    if (ptx::elect_one_sync()) {
+                        while (not ptx::fabric_mbarrier_try_wait_parity(fabric_mbarrier_ptr, fabric_phase & 1)) {}
+                    }
+                    __syncwarp();
                     fabric_phase ^= 1;
                     pending_fabric_bytes = 0;
                 }
@@ -375,7 +368,9 @@ dispatch_impl(
         const auto issue_counted_store = [&](const int& dst_rank_idx, const int& dst_slot_idx) {
             const auto num_bytes = token_layout.get_num_bytes<false>();
             const auto dst_base_ptr = recv_buffer.get_token_buffer(dst_slot_idx).get_base_ptr();
-            const auto counter_ptr = counter_layout.get_counter_ptr(rank_idx);
+            constexpr int kGroupWidth = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumCounterGroups > 0 ? kNumCounterGroups : 1);
+            const auto counter_ptr = counter_layout.get_counter_ptr(kNumCounterGroups > 0 ?
+                rank_idx * kNumCounterGroups + dst_slot_idx / kGroupWidth : rank_idx);
             if (dst_rank_idx == rank_idx) { // local store
                 ptx::tma_store_1d(dst_base_ptr, tma_buffer.get_base_ptr(), num_bytes);
                 ptx::tma_store_commit();
@@ -400,8 +395,7 @@ dispatch_impl(
             const auto token_i64_idx = static_cast<int64_t>(token_idx);
 
             if constexpr (kUseCFTCounted) {
-                if (ptx::elect_one_sync())
-                    flush_pending_counted_send();
+                flush_pending_counted_send();
             } else {
                 ptx::tma_store_wait();
             }
@@ -480,14 +474,14 @@ dispatch_impl(
             __syncwarp();
 
             if constexpr (kUseCFTCounted) {
-                auto send_mask = ptx::gather(stored_dst_slot_idx >= 0);
-                while (send_mask) {
-                    const auto send_lane_idx = __ffs(send_mask) - 1;
-                    send_mask ^= 1u << send_lane_idx;
-                    const auto dst_rank_idx = ptx::exchange(stored_dst_rank_idx, send_lane_idx);
-                    const auto dst_slot_idx = ptx::exchange(stored_dst_slot_idx, send_lane_idx);
-                    if (ptx::elect_one_sync())
-                        issue_counted_store(dst_rank_idx, dst_slot_idx);
+                // Each destination lane issues its own transfer from the shared token.
+                if (stored_dst_slot_idx >= 0)
+                    issue_counted_store(stored_dst_rank_idx, stored_dst_slot_idx);
+                __syncwarp();
+                if (__any_sync(0xffffffff, pending_fabric_bytes > 0)) {
+                    // Submission is per-thread: every issuing lane submits its puts.
+                    if (pending_fabric_bytes > 0)
+                        ptx::fabric_submit();
                     __syncwarp();
                 }
             } else {
@@ -527,33 +521,28 @@ dispatch_impl(
         }
 
         if constexpr (kUseCFTCounted) {
-            if (ptx::elect_one_sync())
-                flush_pending_counted_send();
+            flush_pending_counted_send();
             __syncwarp();
         }
     }
 
-    if constexpr (kUseCFTCounted) {
-        if constexpr (kNumNotifyWarps == 0) {
-            const auto global_thread_idx = sm_idx * kNumThreads + thread_idx;
-            constexpr int kNumGridThreads = kNumSMs * kNumThreads;
-            wait_receive_counters_by_psum(global_thread_idx, kNumGridThreads);
-        }
-        // Finish both receive-counter waits and send flushes before releasing the copy epilogue.
-        __syncthreads();
-    } else {
+    if constexpr (not kUseCFTCounted) {
         // Barrier to ensure data arrival
         comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                           kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
             gin, workspace_layout.get_barrier_signals(), 0, rank_idx, sm_idx, thread_idx);
+
+        // Noncounted consumers retain the original trigger after data arrival.
+        cudaTriggerProgrammaticLaunchCompletion();
     }
 
-    // Trigger the copy epilogue kernel
-    cudaTriggerProgrammaticLaunchCompletion();
+    // Counted buffers reset the slot allocator before the initial barrier,
+    // including noncounted fallback calls on the same buffer.
+    EP_STATIC_ASSERT(not kUseCFTCounted or kResetSenderSlotsEarly, "Counted dispatch requires early slot reset");
 
     // Clean atomic counters
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
-    if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks)
+    if (not kResetSenderSlotsEarly and not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
 }
 

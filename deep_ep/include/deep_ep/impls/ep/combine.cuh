@@ -8,9 +8,9 @@
 #include <deep_ep/layout/ep/token.cuh>
 #include <deep_ep/layout/ep/counter.cuh>
 #include <deep_ep/layout/ep/workspace.cuh>
+#include <deep_ep/impls/ep/epilogue_ready.cuh>
 
 #include <deep_ep/impls/ep/combine_utils.cuh>
-
 
 namespace deep_ep::ep {
 
@@ -23,6 +23,7 @@ template <bool kUseCFTCounted,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          int kNumCounterGroups = 0,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           bool kUseRankLayout = use_rank_layout<kAllowMultipleReduction, kNumRanks, kNumTopk>(),
@@ -38,7 +39,10 @@ combine_impl(nv_bfloat16* x,
              const uint32_t* counted_scaleup_le_ids,
              const int rank_idx,
              int num_reduced_tokens,
-             const int num_combined_tokens) {
+             const int num_combined_tokens, const int num_epilogue_blocks) {
+    EP_STATIC_ASSERT(kNumCounterGroups == (kUseCFTCounted ? 8 : 0), "Counted arrivals require eight groups");
+    EP_STATIC_ASSERT(not kUseCFTCounted or kIsScaleupNVLink, "Counted arrivals require NVLink");
+
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -76,7 +80,7 @@ combine_impl(nv_bfloat16* x,
             math::align<int64_t>(
                 math::ptr_diff(counted_send_buffer.get_buffer_end_ptr(), buffer),
                 layout::CounterLayout::kCounterStrideBytes)),
-        kNumRanks);
+        (kNumCounterGroups > 0 ? kNumRanks * kNumCounterGroups : kNumRanks));
     const auto token_bytes = static_cast<uint64_t>(token_layout.get_num_bytes<false>());
 
     // Init TMA
@@ -105,11 +109,30 @@ combine_impl(nv_bfloat16* x,
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumWarps>(sm_idx, warp_idx);
     const auto gin = comm::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
+    // Reset only in the CTA that publishes the all-ranks barrier signals.
+    // Make every reset visible before any thread in this CTA signals a peer.
+    if constexpr (kUseCFTCounted) {
+        if (sm_idx == 0) {
+            for (int src_rank_idx = thread_idx; src_rank_idx < counter_layout.num_scaleup_ranks; src_rank_idx += kNumThreads) {
+                ptx::st_relaxed_sys(counter_layout.get_counter_ptr(src_rank_idx), uint64_t{0});
+            }
+            __syncthreads();
+        }
+    }
+
     // Full barrier to ensure the remote buffer is available
     const auto workspace_layout = layout::EPWorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
         gin, workspace_layout.get_barrier_signals(), 0, rank_idx, sm_idx, thread_idx);
+
+    if constexpr (kUseCFTCounted)
+        cudaTriggerProgrammaticLaunchCompletion();
+
+    if constexpr (kNumCounterGroups > 0) {
+        if (sm_idx == 0)
+            publish_epilogue_ready<false>(workspace_layout.signals.combine_epilogue_ready, num_epilogue_blocks);
+    }
 
     int pending_fabric_bytes = 0;
     uint64_t* pending_local_counter_ptr = nullptr;
@@ -117,7 +140,7 @@ combine_impl(nv_bfloat16* x,
         if constexpr (kUseCFTCounted) {
             if (pending_local_counter_ptr != nullptr) {
                 ptx::tma_store_wait();
-                ptx::red_add_rel_gpu(pending_local_counter_ptr, token_bytes);
+                ptx::red_add_gpu(pending_local_counter_ptr, token_bytes);
                 pending_local_counter_ptr = nullptr;
             }
             if (pending_fabric_bytes > 0) {
@@ -131,9 +154,10 @@ combine_impl(nv_bfloat16* x,
         }
     };
 
-    const auto issue_counted_store = [&](const int& dst_rank_idx, const layout::TokenLayout& dst_token_buffer) {
+    const auto issue_counted_store = [&](const int& dst_rank_idx, const layout::TokenLayout& dst_token_buffer, int dst_token_idx) {
         if constexpr (kUseCFTCounted) {
-            const auto counter_ptr = counter_layout.get_counter_ptr(rank_idx);
+            constexpr int kGroupWidth = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumCounterGroups > 0 ? kNumCounterGroups : 1);
+            const auto counter_ptr = counter_layout.get_counter_ptr(kNumCounterGroups > 0 ? rank_idx * kNumCounterGroups + dst_token_idx / kGroupWidth : rank_idx);
             if (dst_rank_idx == rank_idx) {
                 ptx::tma_store_1d(dst_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(), static_cast<int>(token_bytes));
                 ptx::tma_store_commit();
@@ -148,49 +172,6 @@ combine_impl(nv_bfloat16* x,
                     static_cast<int>(token_bytes),
                     fabric_mbarrier_ptr);
                 pending_fabric_bytes += static_cast<int>(token_bytes);
-            }
-        }
-    };
-
-    const auto wait_receive_counters_by_topk = [&]() {
-        if constexpr (kUseCFTCounted) {
-            // All counted sends are drained before this point, so block 0 can
-            // reuse shared memory to compute receiver-side expected counts.
-            __syncthreads();
-            if (sm_idx == 0) {
-                EP_STATIC_ASSERT(kNumRanks <= 32, "Insufficient rank mask width");
-                constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
-                auto expected_token_count = reinterpret_cast<int*>(smem);
-
-                for (int src_rank_idx = thread_idx; src_rank_idx < kNumRanks; src_rank_idx += kNumThreads)
-                    expected_token_count[src_rank_idx] = 0;
-                __syncthreads();
-
-                for (int token_idx = thread_idx; token_idx < num_combined_tokens; token_idx += kNumThreads) {
-                    unsigned rank_mask = 0;
-                    #pragma unroll
-                    for (int topk_slot_idx = 0; topk_slot_idx < kNumTopk; ++ topk_slot_idx) {
-                        const auto expert_idx =
-                            static_cast<int>(__ldg(combined_topk_idx + token_idx * kNumTopk + topk_slot_idx));
-                        const auto expert_rank_idx = expert_idx >= 0 ? expert_idx / kNumExpertsPerRank : -1;
-                        if (expert_rank_idx >= 0)
-                            rank_mask |= 1u << expert_rank_idx;
-                    }
-                    while (rank_mask) {
-                        const auto src_rank_idx = __ffs(rank_mask) - 1;
-                        rank_mask ^= 1u << src_rank_idx;
-                        atomicAdd_block(expected_token_count + src_rank_idx, 1);
-                    }
-                }
-                __syncthreads();
-
-                // A single block waits for all per-source counters. Kernel
-                // completion then orders the dependent epilogue launch.
-                for (int src_rank_idx = thread_idx; src_rank_idx < kNumRanks; src_rank_idx += kNumThreads) {
-                    const auto expected_bytes = static_cast<uint64_t>(expected_token_count[src_rank_idx]) * token_bytes;
-                    const auto counter_ptr = counter_layout.get_counter_ptr(src_rank_idx);
-                    while (ptx::ld_relaxed_sys(counter_ptr) < expected_bytes) {}
-                }
             }
         }
     };
@@ -277,7 +258,7 @@ combine_impl(nv_bfloat16* x,
                 __syncwarp();
                 if (ptx::elect_one_sync()) {
                     flush_pending_counted_send();
-                    issue_counted_store(src_rank_idx, counted_token_buffer);
+                    issue_counted_store(src_rank_idx, counted_token_buffer, src_token_idx);
                 }
                 __syncwarp();
             } else {
@@ -326,7 +307,7 @@ combine_impl(nv_bfloat16* x,
                 __syncwarp();
                 if (ptx::elect_one_sync()) {
                     flush_pending_counted_send();
-                    issue_counted_store(src_rank_idx, counted_token_buffer);
+                    issue_counted_store(src_rank_idx, counted_token_buffer, src_token_idx);
                 }
             } else {
                 ptx::tma_store_fence();
@@ -408,7 +389,6 @@ combine_impl(nv_bfloat16* x,
             flush_pending_counted_send();
         __syncwarp();
 
-        wait_receive_counters_by_topk();
     } else {
         // Final barrier to ensure data arrival
         comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,

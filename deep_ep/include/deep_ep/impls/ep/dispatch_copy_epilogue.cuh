@@ -4,18 +4,21 @@
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/layout/ep/token.cuh>
+#include <deep_ep/impls/ep/grouped_counted.cuh>
+#include <deep_ep/impls/ep/epilogue_ready.cuh>
 #include <deep_ep/layout/ep/workspace.cuh>
-
 
 namespace deep_ep::ep {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+template <bool kUseCFTCounted, bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
           int kNumHiddenBytes, int kNumSFPacks,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
+          int64_t kNumTimeoutCycles,
+          int kNumCounterGroups = 0,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumThreads = kNumWarps * 32,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
@@ -32,6 +35,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
                             const int scaleout_rank_idx, const int scaleup_rank_idx) {
+    EP_STATIC_ASSERT(kNumCounterGroups == (kUseCFTCounted ? 8 : 0), "Counted arrivals require eight groups");
+
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
@@ -56,9 +61,17 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
     __syncwarp();
 
-    // Will block until the main dispatch kernel has finished and all data are visible
-    // NOTES: PDL is used, please do not use `__ldg`
-    cudaGridDependencySynchronize();
+    // Only counted direct dispatch consumes data before its late PDL join.
+    // Noncounted and hybrid dispatch retain their original dependency boundary.
+    // NOTES: PDL is used, please do not use `__ldg`.
+    if constexpr (kUseCFTCounted) {
+        EP_STATIC_ASSERT(kNumScaleoutRanks == 1, "Counted copy epilogue requires direct dispatch");
+        EP_STATIC_ASSERT(kNumSMs <= layout::EPSignals::kNumMaxEpilogueBlocks, "Too many epilogue blocks");
+        wait_epilogue_ready<kNumTimeoutCycles>(
+            static_cast<layout::EPSignals*>(workspace)->dispatch_epilogue_ready);
+    } else {
+        cudaGridDependencySynchronize();
+    }
 
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
@@ -80,6 +93,17 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             current_rank_end = ptx::exchange(stored_psum_num_recv_tokens, stored_lane_idx);
         }
         const auto buffer_token = scaleup_buffer.get_rank_buffer(current_rank_idx).get_token_buffer(i - current_rank_start);
+
+        if constexpr (kNumCounterGroups > 0) {
+            const auto counter_base = math::advance_ptr(buffer, math::align<int64_t>(
+                math::ptr_diff(scaleup_buffer.get_buffer_end_ptr(), buffer), layout::CounterLayout::kCounterStrideBytes));
+            const auto groups = layout::GroupedCounterLayout<kNumCounterGroups, kNumMaxTokensPerRank>(counter_base, kNumScaleupRanks);
+            const auto slot = i - current_rank_start;
+            const auto start = groups.group(slot) * groups.kGroupWidth;
+            const auto count = min(groups.kGroupWidth, current_rank_end - current_rank_start - start);
+            wait_group_counted<kNumTimeoutCycles>(groups.get_counter_ptr(current_rank_idx, slot),
+                static_cast<uint64_t>(count) * token_layout.get_num_bytes<false>());
+        }
 
         // Wait buffer releases
         ptx::tma_store_wait();
@@ -323,6 +347,11 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             pad_idx += kNumSMs * kNumWarps;
         }
     }
+
+    // Readiness already ordered every input used above. Keep the PDL dependency
+    // join at the end so local producer cleanup can overlap the copy work.
+    if constexpr (kUseCFTCounted)
+        cudaGridDependencySynchronize();
 }
 
 }  // namespace deep_ep::ep

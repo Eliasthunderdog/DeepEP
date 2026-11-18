@@ -10,6 +10,7 @@ struct alignas(kNumRDMAAlignmentBytes) EPSignals {
     static constexpr int kNumMaxExperts = 2048;
     static constexpr int kNumMaxExpertsPerRank = 512;
     static constexpr int kNumMaxChannels = 1280;
+    static constexpr int kNumMaxEpilogueBlocks = 1024;
 
     BarrierSignals barrier_signals;
     int64_t notify_reduction[kNumMaxRanks + kNumMaxExperts];
@@ -20,6 +21,9 @@ struct alignas(kNumRDMAAlignmentBytes) EPSignals {
     int channel_scaleup_tail[kNumMaxChannels][kNumMaxRanks];
     int lb_chunk_idx_counter;
     uint32_t counted_scaleup_le_ids[kNumMaxRanks];
+    // One reusable mailbox per consumer CTA. Each CTA clears only its own slot.
+    uint32_t dispatch_epilogue_ready[kNumMaxEpilogueBlocks];
+    uint32_t combine_epilogue_ready[kNumMaxEpilogueBlocks];
 };
 EP_STATIC_ASSERT(sizeof(EPSignals) <= kNumMaxSignalBytes, "Too many signals");
 

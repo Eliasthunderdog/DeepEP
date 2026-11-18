@@ -48,4 +48,25 @@ struct CounterLayout {
     }
 };
 
+// A bounded number of contiguous token groups. Unlike per-token tracking,
+// the number of distinct fabric counter addresses does not grow with capacity.
+template <int kNumGroups, int kCapacity>
+struct GroupedCounterLayout {
+    static_assert(kNumGroups == 1 || kNumGroups == 2 || kNumGroups == 4 || kNumGroups == 8);
+    static_assert(kCapacity > 0);
+    static constexpr int kGroupWidth = (kCapacity + kNumGroups - 1) / kNumGroups;
+    CounterLayout counters;
+
+    __forceinline__ __device__ __host__
+    GroupedCounterLayout(void* base, int ranks): counters(base, ranks * kNumGroups) {}
+
+    __forceinline__ __device__ __host__
+    static int group(int token) { return token / kGroupWidth; }
+
+    __forceinline__ __device__ __host__
+    uint64_t* get_counter_ptr(int rank, int token) const {
+        return counters.get_counter_ptr(rank * kNumGroups + group(token));
+    }
+};
+
 }  // namespace deep_ep::layout

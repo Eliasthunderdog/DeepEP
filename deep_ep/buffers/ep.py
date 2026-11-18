@@ -209,8 +209,16 @@ class EPBuffer(BufferBase):
     """
     Counted writes are enabled by default on CUDA 13.3+ / SM100+ within one NVLink
     domain (2-32 ranks), for dispatch/combine capacities up to 256 tokens per rank.
-    Set EP_USE_COUNTED_OPS=0 on every rank to use the regular path. Expanded combine
-    without multiple reduction uses the regular path in either mode.
+    Set EP_USE_COUNTED_OPS=0 on every rank to use the regular path, or 1 (default)
+    for automatic selection. Set EP_USE_COUNTED_OPS=force to bypass the 256-token
+    capacity heuristic and require counted dispatch/combine: unsupported topology,
+    layout, or insufficient buffer space raises instead of silently falling back.
+    Counted dispatch/combine use eight arrival groups. Counted combine reduction
+    uses four warps per token when the shape supports it, otherwise one. Both
+    counted and regular epilogues use the full device SM count.
+    Expanded combine requires allow_multiple_reduction=True in force mode.
+    Set the same mode on every rank before constructing the buffer; do not change
+    it during the buffer lifetime or reuse captured graphs across modes.
 
     The EP communication buffer, which supports:
         - high-throughput expert-parallel all-to-all (dispatch and combine, using NVLink and/or RDMA)
@@ -372,15 +380,20 @@ class EPBuffer(BufferBase):
 
     def _setup_counted_scaleup(self) -> None:
         # `EP_USE_COUNTED_DISPATCH` is kept as a compatibility alias for existing scripts.
-        enabled = os.environ.get('EP_USE_COUNTED_OPS', os.environ.get('EP_USE_COUNTED_DISPATCH', '1')) != '0'
-        local_supported = enabled and self.runtime.supports_counted_scaleup()
-        supported_by_rank = [None] * self.num_ranks
-        dist.all_gather_object(supported_by_rank, local_supported, self.group)
-
-        if not any(supported_by_rank):
+        mode = os.environ.get('EP_USE_COUNTED_OPS', os.environ.get('EP_USE_COUNTED_DISPATCH', '1'))
+        local_supported = self.runtime.supports_counted_scaleup()
+        settings = [None] * self.num_ranks
+        dist.all_gather_object(settings, (mode, local_supported), self.group)
+        modes = [item[0] for item in settings]
+        if any(value not in ('0', '1', 'force') for value in modes) or len(set(modes)) != 1:
+            raise RuntimeError(f'EP_USE_COUNTED_OPS must be 0, 1, or force and identical across ranks: {modes}')
+        if mode == '0':
+            return
+        supported_by_rank = [item[1] for item in settings]
+        if not any(supported_by_rank) and mode != 'force':
             return
         if not all(supported_by_rank):
-            raise RuntimeError(f'Counted scale-up support is inconsistent across ranks: {supported_by_rank}')
+            raise RuntimeError(f'Counted scale-up is unavailable on one or more ranks: {supported_by_rank}')
 
         local_handle = bytes(self.runtime.export_counted_scaleup_le_handle())
         handles = [None] * self.num_ranks

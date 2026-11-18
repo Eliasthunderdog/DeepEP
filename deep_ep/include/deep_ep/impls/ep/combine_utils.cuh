@@ -52,7 +52,8 @@ void compute_topk_slots(int (&topk_slot_idx)[kNumValidTopk], uint32_t mask,
     }
 }
 
-template <int kHiddenVec, int kUnrollFactor, int kNumExpectedTopk, int kNumValidTopk,
+template <int kHiddenVec, int kUnrollFactor, int kNumExpectedTopk,
+          bool kCoherentLoads = false, int kNumValidTopk,
           typename vec_t, typename get_src_buffer_ptr_func_t, typename wait_buffer_func_t>
 __device__ __forceinline__
 void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
@@ -60,6 +61,20 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
                     const get_src_buffer_ptr_func_t& get_src_buffer_ptr_func,
                     const wait_buffer_func_t& wait_buffer_func,
                     vec_t* bias_0 = nullptr, vec_t* bias_1 = nullptr) {
+    const auto load = [](const vec_t* ptr, int lhs = 1, int rhs = 0) {
+        if constexpr (kCoherentLoads) {
+            static_assert(sizeof(vec_t) == sizeof(int4));
+            return ptx::ld_global_with_ge_pred(ptr, lhs, rhs);
+        } else {
+            return ptx::ldg_with_ge_pred(ptr, lhs, rhs);
+        }
+    };
+    const auto load_unconditional = [](const vec_t* ptr) {
+        if constexpr (kCoherentLoads)
+            return ptx::ld_global_with_ge_pred(ptr);
+        else
+            return ptx::ldg(ptr);
+    };
     constexpr int kNumElemsPerVec = sizeof(vec_t) / sizeof(nv_bfloat16);
     EP_STATIC_ASSERT(kNumElemsPerVec % 2 == 0, "Invalid number of elements");
     EP_STATIC_ASSERT(kHiddenVec % (kUnrollFactor * 32) == 0, "Invalid unrolling");
@@ -79,7 +94,7 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
             vec_t values_0[kUnrollFactor] = {};
             #pragma unroll
             for (int j = 0; j < kUnrollFactor; ++ j) {
-                values_0[j] = ptx::ldg_with_ge_pred(
+                values_0[j] = load(
                     src_base_ptr_0 + (i * (kUnrollFactor * 32) + j * 32 + lane_idx), slot_0, 0);
             }
 
@@ -89,7 +104,7 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
             const auto src_base_ptr_1 = get_src_buffer_ptr_func(slot_1);
             #pragma unroll
             for (int j = 0; j < kUnrollFactor; ++ j) {
-                values_1[j] = ptx::ldg_with_ge_pred(
+                values_1[j] = load(
                     src_base_ptr_1 + (i * (kUnrollFactor * 32) + j * 32 + lane_idx), slot_1, 0);
             }
 
@@ -118,7 +133,7 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
                 vec_t values[kUnrollFactor];
                 #pragma unroll
                 for (int j = 0; j < kUnrollFactor; ++ j)
-                    values[j] = ptx::ldg(base_ptr + i * (kUnrollFactor * 32) + j * 32 + lane_idx);
+                    values[j] = load_unconditional(base_ptr + i * (kUnrollFactor * 32) + j * 32 + lane_idx);
 
                 // Reduce
                 const auto bf162_view = reinterpret_cast<nv_bfloat162*>(values);
@@ -140,7 +155,7 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
                 vec_t values[kUnrollFactor] = {};
                 #pragma unroll
                 for (int j = 0; j < kUnrollFactor; ++ j) {
-                    values[j] = ptx::ldg_with_ge_pred(
+                    values[j] = load(
                         src_base_ptr + (i * (kUnrollFactor * 32) + j * 32 + lane_idx), topk_slot_idx[k], 0);
                 }
 

@@ -317,6 +317,18 @@ __forceinline__ __device__ void named_barrier_unaligned(const int& idx) {
 }
 
 /// LD/ST instructions
+// Coherent vector loads for payloads published while the consuming grid runs.
+// The readonly (.nc) proxy used by ldg is unsuitable for these receive buffers.
+__forceinline__ __device__ int4 ld_global_with_ge_pred(const int4* ptr, int lhs = 1, int rhs = 0) {
+    int4 ret = make_int4(0, 0, 0, 0);
+    asm volatile(
+        "{ .reg .pred p; setp.ge.s32 p, %5, %6; "
+        "@p ld.global.v4.s32 {%0, %1, %2, %3}, [%4]; }"
+        : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
+        : "l"(ptr), "r"(lhs), "r"(rhs) : "memory");
+    return ret;
+}
+
 __forceinline__ __device__ int4 ldg_with_ge_pred(const int4* ptr, const int& lhs = 1, const int& rhs = 0, const L2CacheHint& cache_hint = L2CacheHint::kEvictFirst) {
     int4 ret = make_int4(0, 0, 0, 0);
     asm volatile(
@@ -475,6 +487,10 @@ __forceinline__ __device__ dtype_t ld_volatile(const void* ptr) {
 __forceinline__ __device__ void red_add(const int64_t* ptr, const int64_t& value) {
     // TODO(NVCC): why don't NVCC support `s64`?
     asm volatile("red.gpu.global.add.u64 [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
+__forceinline__ __device__ void red_add_gpu(const uint64_t* ptr, const uint64_t& value) {
+    asm volatile("red.relaxed.gpu.global.add.u64 [%0], %1;" :: "l"(ptr), "l"(value) : "memory");
 }
 
 __forceinline__ __device__ void red_add_rel_gpu(const uint64_t* ptr, const uint64_t& value) {

@@ -14,6 +14,7 @@
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/layout/ep/token.cuh>
 #include <deep_ep/layout/ep/counter.cuh>
+#include <deep_ep/layout/ep/workspace.cuh>
 
 #include "../../runtime/jit.hpp"
 
@@ -28,22 +29,6 @@ static int get_num_notify_smem_bytes(const int& num_ranks, const int& num_expert
 static layout::TokenLayout get_dispatch_token_layout(
     const int& hidden, const int& elem_size, const int& num_sf_packs, const int& num_topk) {
     return layout::TokenLayout(hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
-}
-
-static void* get_direct_dispatch_counted_counter_buffer(void* buffer,
-                                                        const layout::TokenLayout& token_layout,
-                                                        const int& num_max_tokens_per_rank,
-                                                        const int& num_scaleup_ranks) {
-    const auto recv_buffer_layout = layout::BufferLayout<false>(
-        token_layout, num_scaleup_ranks, num_max_tokens_per_rank, buffer);
-    const auto send_buffer_layout = layout::BufferLayout<false>(
-        token_layout, 0, num_max_tokens_per_rank,
-        recv_buffer_layout.get_buffer_end_ptr());
-    return math::advance_ptr(
-        buffer,
-        math::align<int64_t>(
-            math::ptr_diff(send_buffer_layout.get_buffer_end_ptr(), buffer),
-            layout::CounterLayout::kCounterStrideBytes));
 }
 
 static void launch_dispatch(void* x, void* sf,
@@ -71,6 +56,7 @@ static void launch_dispatch(void* x, void* sf,
                             const bool& do_cpu_sync,
                             const bool& use_cft_counted,
                             uint32_t* counted_scaleup_le_ids,
+                            const int& num_epilogue_sms, const int& num_counter_groups, const bool& reset_sender_slots_early,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -134,18 +120,11 @@ static void launch_dispatch(void* x, void* sf,
         num_threads = (num_notify_warps + num_scaleout_warps + num_forward_warps) * 32;
     }
 
-    if (use_cft_counted) {
-        void* counter_buffer = get_direct_dispatch_counted_counter_buffer(
-            buffer, token_layout, num_max_tokens_per_rank, num_scaleup_ranks);
-        const auto counter_layout = layout::CounterLayout(counter_buffer, num_scaleup_ranks);
-        CUDA_RUNTIME_CHECK(cudaMemsetAsync(counter_buffer, 0, counter_layout.get_num_bytes(), stream));
-    }
-
     // Compile
     std::string header_name, func_name;
     if (num_scaleout_ranks == 1) {
         header_name = "dispatch";
-        func_name = std::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+        func_name = std::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
             use_cft_counted, is_scaleup_nvlink,
             do_cpu_sync,
             reuse_slot_indices,
@@ -155,7 +134,7 @@ static void launch_dispatch(void* x, void* sf,
             hidden * elem_size, num_sf_packs,
             num_max_tokens_per_rank,
             num_experts, num_topk, expert_alignment,
-            num_qps, num_timeout_cycles);
+            num_qps, num_timeout_cycles, num_counter_groups, reset_sender_slots_early);
     } else {
         header_name = "hybrid_dispatch";
         func_name = std::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -187,6 +166,8 @@ static void __instantiate_kernel() {{
         .cooperative = true,
     };
     if (num_scaleout_ranks == 1) {
+        if (use_cft_counted)
+            EP_HOST_ASSERT(num_epilogue_sms <= layout::EPSignals::kNumMaxEpilogueBlocks);
         jit->launch(
             kernel, options,
             x, static_cast<sf_pack_t*>(sf), topk_idx, topk_weights,
@@ -201,7 +182,7 @@ static void __instantiate_kernel() {{
             buffer,
             workspace, mapped_host_workspace,
             counted_scaleup_le_ids,
-            scaleup_rank_idx
+            scaleup_rank_idx, num_epilogue_sms
         );
     } else {
         jit->launch(
@@ -241,6 +222,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
                                           const bool& do_zero_padding,
+                                          const bool& use_cft_counted, const int64_t& num_timeout_cycles, const int& num_counter_groups,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -252,14 +234,14 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
 #include <deep_ep/impls/ep/dispatch_copy_epilogue.cuh>
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)", do_expand, cached_mode, do_zero_padding,
+)", use_cft_counted, do_expand, cached_mode, do_zero_padding,
         num_sms, num_channels, num_warps,
         num_scaleout_ranks, num_scaleup_ranks,
         num_hidden_bytes, num_sf_packs,
         num_max_tokens_per_rank,
-        num_experts, num_topk, expert_alignment));
+        num_experts, num_topk, expert_alignment, num_timeout_cycles, num_counter_groups));
 
     // Launch
     jit->launch(

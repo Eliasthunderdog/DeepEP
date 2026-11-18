@@ -37,6 +37,10 @@ class EPBuffer: public BufferBase {
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
 
+    // Fixed at construction, like the Python-side collective counted-mode setup.
+    const bool force_cft_counted = get_env<std::string>(
+        "EP_USE_COUNTED_OPS", get_env<std::string>("EP_USE_COUNTED_DISPATCH", "1")) == "force";
+
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
     static constexpr int kNumMaxSMs = 160;
@@ -232,7 +236,7 @@ public:
             if (not use_cft_counted)
                 return data_bytes;
             return math::align<int64_t>(data_bytes, layout::CounterLayout::kCounterStrideBytes) +
-                   layout::CounterLayout::get_num_bytes(num_scaleup_ranks);
+                   layout::CounterLayout::get_num_bytes(num_scaleup_ranks * 8);
         } else {
             // Hybrid dispatch
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
@@ -270,7 +274,7 @@ public:
             if (not use_cft_counted)
                 return data_bytes;
             return math::align<int64_t>(data_bytes, layout::CounterLayout::kCounterStrideBytes) +
-                   layout::CounterLayout::get_num_bytes(num_scaleup_ranks);
+                   layout::CounterLayout::get_num_bytes(num_scaleup_ranks * 8);
         } else {
             // Hybrid combine
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
@@ -605,8 +609,10 @@ public:
         const bool use_cft_counted_dispatch =
             supports_counted_scaleup() and
             is_counted_scaleup_ready() and
-            num_max_tokens_per_rank <= kCFTCountedDispatchMaxTokensPerRank and
+            (force_cft_counted or num_max_tokens_per_rank <= kCFTCountedDispatchMaxTokensPerRank) and
             counted_dispatch_buffer_bytes <= num_buffer_bytes;
+        EP_HOST_ASSERT((not force_cft_counted or use_cft_counted_dispatch) and
+                       "Forced counted dispatch requires supported topology, ready endpoints, and sufficient buffer space");
         auto counted_scaleup_le_ids = use_cft_counted_dispatch ?
             static_cast<layout::EPSignals*>(context->workspace)->counted_scaleup_le_ids : nullptr;
 
@@ -625,6 +631,9 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_rank_count_ptr<false>(), context->num_scaleup_ranks, 0);
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
+
+        const int num_counter_groups = use_cft_counted_dispatch ? 8 : 0;
+        const auto num_epilogue_sms = jit->device.get_num_sms();
 
         // Do dispatch into the buffers (with SM limitation)
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -650,6 +659,7 @@ public:
                         num_qps, context->num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
                         use_cft_counted_dispatch, counted_scaleup_le_ids,
+                        num_epilogue_sms, num_counter_groups, is_counted_scaleup_ready(),
                         comm_stream);
 
         // For tensor recording
@@ -791,7 +801,7 @@ public:
             }
             EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
-            // Launch copy kernels with full SMs
+            // Capture the same block count used for producer mailboxes.
             launch_dispatch_copy_epilogue(context->buffer, context->workspace,
                                           psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                           psum_num_recv_tokens_per_expert.data_ptr<int>(),
@@ -806,11 +816,12 @@ public:
                                           num_experts, num_topk, expert_alignment,
                                           context->scaleout_rank_idx, context->scaleup_rank_idx,
                                           context->num_scaleout_ranks, context->num_scaleup_ranks,
-                                          jit->device.get_num_sms(),
+                                          num_epilogue_sms,
                                           jit->device.get_num_smem_bytes(),
                                           num_channels,
                                           do_expand, cached_mode,
                                           do_zero_padding,
+                                          use_cft_counted_dispatch, context->num_gpu_timeout_cycles, num_counter_groups,
                                           stream);
 
             auto result = pybind11::make_tuple(
@@ -943,8 +954,11 @@ public:
             context->num_scaleout_ranks == 1 and
             context->is_scaleup_nvlink and
             not (use_expanded_layout and not allow_multiple_reduction) and
-            num_max_tokens_per_rank <= kCFTCountedCombineMaxTokensPerRank and
+            (force_cft_counted or num_max_tokens_per_rank <= kCFTCountedCombineMaxTokensPerRank) and
             counted_combine_buffer_bytes <= num_buffer_bytes;
+        EP_HOST_ASSERT((not force_cft_counted or use_cft_counted_combine) and
+                       "Forced counted combine requires supported topology/layout, ready endpoints, and sufficient buffer space; "
+                       "expanded combine requires allow_multiple_reduction=True");
         auto counted_scaleup_le_ids = use_cft_counted_combine ?
             static_cast<layout::EPSignals*>(context->workspace)->counted_scaleup_le_ids : nullptr;
 
@@ -980,6 +994,8 @@ public:
 
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
+        const int num_counter_groups = use_cft_counted_combine ? 8 : 0;
+        const auto num_epilogue_sms = jit->device.get_num_sms();
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
@@ -1000,6 +1016,7 @@ public:
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
             use_cft_counted_combine, counted_scaleup_le_ids,
+            num_epilogue_sms, num_counter_groups,
             comm_stream);
 
         // For tensor recording
@@ -1034,13 +1051,14 @@ public:
                                            num_combined_tokens, num_max_tokens_per_rank,
                                            hidden,
                                            num_experts, num_topk,
-                                           reduce_buffer,
+                                           reduce_buffer, context->workspace,
                                            bias_ptrs[0], bias_ptrs[1],
                                            context->num_scaleout_ranks, context->num_scaleup_ranks,
                                            context->scaleout_rank_idx, context->scaleup_rank_idx,
-                                           jit->device.get_num_sms(),
+                                           num_epilogue_sms,
                                            jit->device.get_num_smem_bytes(),
                                            use_expanded_layout, allow_multiple_reduction,
+                                           use_cft_counted_combine, context->num_gpu_timeout_cycles, num_counter_groups,
                                            stream);
 
             if (tensors_to_record_opt.has_value()) {
